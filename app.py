@@ -13,6 +13,9 @@ import cv2
 from PIL import Image, ImageTk
 from ultralytics import YOLO, YOLOWorld
 
+import metrics
+
+LOGGING = True
 
 MODEL_PATH = "yolov8n.pt"
 EXTRA_MODEL_PATH = "yolov8s-worldv2.pt"
@@ -54,6 +57,11 @@ class YoloDashboard:
         self.extra_frame_count = 0
         self.last_fps_time = time.time()
         self.photo = None
+        self.latest_capture_ms = 0.0
+        self._log_frame_idx = 0
+
+        if LOGGING:
+            metrics.init_csv_files()
 
         self._build_ui()
         self._load_model()
@@ -129,7 +137,10 @@ class YoloDashboard:
         ).pack(fill="x", pady=(0, 10))
 
         self.start_btn = ttk.Button(control_card, text="Start RTSP Camera", command=self.start_camera)
-        self.start_btn.pack(fill="x", pady=(8, 8), ipady=8)
+        self.start_btn.pack(fill="x", pady=(8, 4), ipady=8)
+
+        self.webcam_btn = ttk.Button(control_card, text="Start Webcam", command=self.start_webcam)
+        self.webcam_btn.pack(fill="x", pady=(0, 8), ipady=8)
 
         self.stop_btn = ttk.Button(control_card, text="Stop Camera", command=self.stop_camera, state="disabled")
         self.stop_btn.pack(fill="x", pady=(0, 8), ipady=8)
@@ -237,13 +248,30 @@ class YoloDashboard:
             messagebox.showwarning("Invalid RTSP URL", "Enter a valid RTSP URL beginning with rtsp://")
             return
 
-        self.cap = self._open_rtsp_camera(rtsp_url)
-        if not self.cap.isOpened():
-            self.cap.release()
-            self.cap = None
-            messagebox.showerror("Camera Error", "Could not open RTSP camera. Check the URL, network, username, and password.")
-            return
+        self.status_var.set("Connecting to camera...")
+        self.start_btn.configure(state="disabled")
+        self.webcam_btn.configure(state="disabled")
+        self.rtsp_url_entry.configure(state="disabled")
 
+        threading.Thread(target=self._connect_rtsp, args=(rtsp_url,), daemon=True).start()
+
+    def _connect_rtsp(self, rtsp_url):
+        cap = self._open_rtsp_camera(rtsp_url)
+        if not cap.isOpened():
+            cap.release()
+            self.root.after(0, self._on_rtsp_failed)
+            return
+        self.root.after(0, self._on_rtsp_connected, cap)
+
+    def _on_rtsp_failed(self):
+        self.status_var.set("Ready")
+        self.start_btn.configure(state="normal")
+        self.webcam_btn.configure(state="normal")
+        self.rtsp_url_entry.configure(state="normal")
+        messagebox.showerror("Camera Error", "Could not open RTSP camera. Check the URL, network, username, and password.")
+
+    def _on_rtsp_connected(self, cap):
+        self.cap = cap
         self.running = True
         self.latest_frame = None
         self.latest_frame_id = 0
@@ -253,8 +281,41 @@ class YoloDashboard:
         self.last_fps_time = time.time()
         self.status_var.set("RTSP camera running")
         self.camera_var.set("Source: RTSP stream")
+        self.stop_btn.configure(state="normal")
+        self.snapshot_btn.configure(state="normal")
+
+        self.capture_worker = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_worker.start()
+
+        self.worker = threading.Thread(target=self._camera_loop, daemon=True)
+        self.worker.start()
+
+    def start_webcam(self):
+        if self.running:
+            return
+        if self.model is None:
+            messagebox.showwarning("Model Not Ready", "YOLO model is not loaded.")
+            return
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            cap.release()
+            messagebox.showerror("Webcam Error", "Could not open webcam (index 0).")
+            return
+
+        self.cap = cap
+        self.running = True
+        self.latest_frame = None
+        self.latest_frame_id = 0
+        self.read_failures = 0
+        self.frame_count = 0
+        self.extra_frame_count = 0
+        self.last_fps_time = time.time()
+        self.status_var.set("Webcam running")
+        self.camera_var.set("Source: Webcam (0)")
         self.rtsp_url_entry.configure(state="disabled")
         self.start_btn.configure(state="disabled")
+        self.webcam_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.snapshot_btn.configure(state="normal")
 
@@ -278,6 +339,7 @@ class YoloDashboard:
         self.status_var.set("Stopping camera...")
         self.rtsp_url_entry.configure(state="normal")
         self.start_btn.configure(state="normal")
+        self.webcam_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
         self.snapshot_btn.configure(state="disabled")
 
@@ -294,7 +356,9 @@ class YoloDashboard:
             if cap is None:
                 break
 
+            t0 = time.perf_counter()
             ret, frame = cap.read()
+            capture_ms = (time.perf_counter() - t0) * 1000
             if not self.running:
                 break
 
@@ -302,6 +366,7 @@ class YoloDashboard:
                 with self.frame_lock:
                     self.latest_frame = frame
                     self.latest_frame_id += 1
+                    self.latest_capture_ms = capture_ms
                 self.read_failures = 0
                 continue
 
@@ -323,15 +388,21 @@ class YoloDashboard:
             with self.frame_lock:
                 frame_id = self.latest_frame_id
                 frame = None if self.latest_frame is None else self.latest_frame.copy()
+                capture_ms = self.latest_capture_ms
 
             if frame is None or frame_id == last_processed_id:
                 time.sleep(0.005)
                 continue
 
             last_processed_id = frame_id
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
 
+            t_yolo8 = time.perf_counter()
             results = self.model(frame, verbose=False)
-            annotated = results[0].plot()
+            t_yolo8_end = time.perf_counter()
+
+            t_world = time.perf_counter()
+            extra_results = None
             if self.extra_model is not None:
                 extra_results = self.extra_model(
                     frame,
@@ -339,15 +410,29 @@ class YoloDashboard:
                     conf=EXTRA_CONFIDENCE,
                     iou=EXTRA_IOU,
                 )
+            t_world_end = time.perf_counter()
+
+            t_ann = time.perf_counter()
+            annotated = results[0].plot()
+            if extra_results is not None:
                 annotated, extra_counts = self._draw_extra_detections(annotated, extra_results[0])
                 self.extra_frame_count += 1
                 if self.extra_frame_count % 5 == 0:
                     self.root.after(0, self._update_extra_hits, extra_counts)
-
             annotated = cv2.resize(annotated, DISPLAY_SIZE)
             annotated = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-
             image = Image.fromarray(annotated)
+            t_ann_end = time.perf_counter()
+
+            if LOGGING:
+                yolov8_ms = (t_yolo8_end - t_yolo8) * 1000
+                yoloworld_ms = (t_world_end - t_world) * 1000 if extra_results is not None else 0.0
+                annotate_ms = (t_ann_end - t_ann) * 1000
+                metrics.log_latency(self._log_frame_idx, ts, capture_ms, yolov8_ms, yoloworld_ms, annotate_ms)
+                metrics.log_detections(ts, "yolov8", results[0])
+                if extra_results is not None:
+                    metrics.log_detections(ts, "yoloworld", extra_results[0])
+                self._log_frame_idx += 1
 
             self.frame_count += 1
             now = time.time()
