@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-yolo_snapshot_*.png
 Building detection/
 Building detection.zip
 tree_dataset.zip
