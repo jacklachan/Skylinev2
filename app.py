@@ -507,7 +507,8 @@ class YoloDashboard:
         if self.photo is None:
             return
 
-        filename = f"yolo_snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        os.makedirs("snapshots", exist_ok=True)
+        filename = f"snapshots/yolo_snapshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
         image = ImageTk.getimage(self.photo)
         image.save(filename)
         self.status_var.set(f"Saved {filename}")
